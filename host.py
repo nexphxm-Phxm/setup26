@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 """
 🚀 ADVANCED BOT HOSTING SYSTEM V3.1 🚀
 Modern Dashboard | Enhanced Security | Advanced Admin Controls
 Creator: @abbsydurov
 Channel: https://t.me/DEviNePORTaL
-Features: Save & Update Bot Source Files
+Features: Save & Update Bot Source Files | Fixed Error Logs & Save Source
 """
 
 import os
@@ -126,8 +125,8 @@ class Project:
     last_restart: datetime = None
     error_log: str = ""
     start_count: int = 0
-    source_hash: str = None  # For tracking source changes
-    version: str = "1.0.0"  # Version tracking
+    source_hash: str = None
+    version: str = "1.0.0"
     last_updated: datetime = None
 
 # ===== DATABASE MANAGER =====
@@ -162,7 +161,7 @@ class DatabaseManager:
                 )
             """)
             
-            # Projects table with new columns
+            # Projects table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS projects (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -206,6 +205,8 @@ class DatabaseManager:
                 conn.execute("ALTER TABLE projects ADD COLUMN version TEXT DEFAULT '1.0.0'")
             if 'last_updated' not in columns:
                 conn.execute("ALTER TABLE projects ADD COLUMN last_updated TIMESTAMP")
+            if 'error_log' not in columns:
+                conn.execute("ALTER TABLE projects ADD COLUMN error_log TEXT DEFAULT ''")
             
             # Admins table
             conn.execute("""
@@ -521,7 +522,7 @@ class DatabaseManager:
                 project.memory_usage,
                 project.restart_count,
                 project.last_restart.isoformat() if project.last_restart else None,
-                project.error_log,
+                project.error_log or "",
                 project.start_count,
                 project.source_hash,
                 project.version,
@@ -604,6 +605,14 @@ class DatabaseManager:
                 ORDER BY created_at DESC
             """, (project_id,)).fetchall()
             return [dict(row) for row in rows]
+    
+    def add_backup(self, project_id: int, backup_path: str, size: int):
+        with self.get_connection() as conn:
+            conn.execute("""
+                INSERT INTO backups (project_id, backup_path, size)
+                VALUES (?, ?, ?)
+            """, (project_id, backup_path, size))
+            conn.commit()
 
 # ===== PROJECT MANAGER =====
 class ProjectManager:
@@ -631,7 +640,6 @@ class ProjectManager:
         """Calculate hash of all source files"""
         hash_md5 = hashlib.md5()
         for root, dirs, files in os.walk(directory):
-            # Skip virtual environment and cache directories
             if any(skip in root for skip in ['__pycache__', '.venv', 'venv', 'node_modules', '.git']):
                 continue
             for file in sorted(files):
@@ -646,33 +654,44 @@ class ProjectManager:
                     pass
         return hash_md5.hexdigest()
     
-    def backup_project_source(self, project: Project) -> Tuple[bool, str]:
-        """Backup the entire project source code"""
+    def backup_project_source(self, project: Project) -> Tuple[bool, str, Optional[str]]:
+        """Backup the entire project source code and return (success, message, file_path)"""
         try:
             project_path = self.get_project_path(project.user_id, project.name)
             if not os.path.exists(project_path):
-                return False, "Project directory not found"
+                return False, "Project directory not found", None
             
-            # Create backup filename
+            # Create backup directory if not exists
+            os.makedirs(SOURCE_BACKUP_DIR, exist_ok=True)
+            
             version = project.version or "1.0.0"
-            backup_path = self.get_backup_path(project.id, version)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_filename = f"{project.name}_v{version}_{timestamp}.zip"
+            backup_path = os.path.join(SOURCE_BACKUP_DIR, backup_filename)
             
-            # Create ZIP
+            # Create ZIP file
             with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for root, dirs, files in os.walk(project_path):
                     # Skip virtual environment and cache
-                    if any(skip in root for skip in ['__pycache__', '.venv', 'venv', 'node_modules', '.git']):
+                    if any(skip in root for skip in ['__pycache__', '.venv', 'venv', 'node_modules', '.git', 'env']):
                         continue
                     for file in files:
                         file_path = os.path.join(root, file)
+                        # Skip compiled files
+                        if file.endswith(('.pyc', '.pyo', '.so')):
+                            continue
                         arcname = os.path.relpath(file_path, project_path)
                         zipf.write(file_path, arcname)
             
-            return True, backup_path
+            # Record backup in database
+            size = os.path.getsize(backup_path)
+            self.db.add_backup(project.id, backup_path, size)
+            
+            return True, backup_path, backup_path
             
         except Exception as e:
             self.logger.error(f"Backup error: {e}")
-            return False, str(e)
+            return False, str(e), None
     
     def update_project_source(self, project_id: int, zip_path: str, new_version: str) -> Tuple[bool, str]:
         """Update project source from ZIP"""
@@ -681,40 +700,32 @@ class ProjectManager:
             return False, "Project not found"
         
         try:
-            # Stop project if running
             was_running = project_id in self.running_processes
             if was_running:
                 self.stop_project(project_id)
                 time.sleep(2)
             
-            # Create old version backup
             old_version = project.version
             project.status = ProjectStatus.UPDATING
             self.db.update_project(project)
             
-            # Backup current source
-            backup_success, backup_path = self.backup_project_source(project)
+            backup_success, backup_message, backup_path = self.backup_project_source(project)
             if not backup_success:
-                return False, f"Backup failed: {backup_path}"
+                return False, f"Backup failed: {backup_message}"
             
-            # Get project directory
             project_path = self.get_project_path(project.user_id, project.name)
             
-            # Remove old source (keep requirements.txt and package.json if they exist)
+            important_files = []
             if os.path.exists(project_path):
-                # Save important files
-                important_files = []
                 for root, dirs, files in os.walk(project_path):
                     for file in files:
-                        if file in ['requirements.txt', 'package.json', 'Procfile', 'Dockerfile']:
+                        if file in ['requirements.txt', 'package.json', 'Procfile', 'Dockerfile', '.env']:
                             important_files.append(os.path.join(root, file))
                 
-                # Remove old files
                 shutil.rmtree(project_path)
             
             os.makedirs(project_path, exist_ok=True)
             
-            # Extract new source
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(project_path)
             
@@ -723,39 +734,33 @@ class ProjectManager:
                 if not os.path.exists(file_path):
                     shutil.copy(file_path, project_path)
             
-            # Find main file
             main_file = self.find_main_file(project_path)
             if not main_file:
                 return False, "No main file found in update"
             
-            # Detect framework
             framework, project_type = self.detect_framework(project_path, main_file)
             
-            # Update project
             project.main_file = main_file
             project.framework = framework
             project.project_type = project_type
             project.version = new_version
             project.source_hash = self.calculate_source_hash(project_path)
             project.last_updated = datetime.now()
-            project.deps_installed = False  # Need to reinstall dependencies
+            project.deps_installed = False
             project.status = ProjectStatus.STOPPED
             self.db.update_project(project)
             
-            # Install dependencies
             success, message = self.install_dependencies(project_path, framework)
             if success:
                 project.deps_installed = True
                 self.db.update_project(project)
             
-            # Log update
             self.db.add_source_update(
                 project_id, old_version, new_version, 
-                backup_path, os.path.getsize(backup_path), 
+                backup_path, os.path.getsize(backup_path) if backup_path else 0, 
                 project.user_id
             )
             
-            # Restart if was running
             if was_running:
                 success, message = self.start_project(project_id)
             
@@ -775,15 +780,13 @@ class ProjectManager:
             "main.py", "bot.py", "app.py", "server.py", "run.py", "start.py",
             "index.js", "server.js", "app.js", "bot.js", "main.js",
             "main.ts", "server.ts", "app.ts", "index.ts",
-            "manage.py", "wsgi.py", "app.py"
+            "manage.py", "wsgi.py"
         ]
         
-        # Check root directory
         for fname in priority_files:
             if os.path.exists(os.path.join(directory, fname)):
                 return fname
         
-        # Check package.json
         if os.path.exists(os.path.join(directory, "package.json")):
             try:
                 with open(os.path.join(directory, "package.json")) as f:
@@ -793,13 +796,11 @@ class ProjectManager:
             except:
                 pass
         
-        # Recursive search
         for root, dirs, files in os.walk(directory):
             for file in files:
                 if file in priority_files:
                     return os.path.relpath(os.path.join(root, file), directory)
         
-        # Fallback: any Python or JS file
         for root, dirs, files in os.walk(directory):
             for file in files:
                 if file.endswith((".py", ".js", ".ts")):
@@ -868,7 +869,6 @@ class ProjectManager:
     
     def install_dependencies(self, project_dir: str, framework: str) -> Tuple[bool, str]:
         try:
-            # Python dependencies
             req_file = self.find_requirements_txt(project_dir)
             if req_file and ('python' in framework.lower() or 'telegram' in framework.lower()):
                 result = subprocess.run(
@@ -880,7 +880,6 @@ class ProjectManager:
                 else:
                     return False, f"Python install failed: {result.stderr[:500]}"
             
-            # Node.js dependencies
             package_json = None
             for root, dirs, files in os.walk(project_dir):
                 if 'package.json' in files:
@@ -920,7 +919,6 @@ class ProjectManager:
                 return [sys.executable, "-u", main_file]
         
         elif main_file.endswith(('.js', '.mjs')):
-            # Check if using npm start
             if os.path.exists(os.path.join(project_dir, 'package.json')):
                 try:
                     with open(os.path.join(project_dir, 'package.json')) as f:
@@ -951,7 +949,6 @@ class ProjectManager:
                 if not os.path.exists(project_dir):
                     return False, "Project directory not found"
                 
-                # Install dependencies if not installed
                 if not project.deps_installed:
                     success, message = self.install_dependencies(project_dir, project.framework)
                     if not success:
@@ -959,21 +956,21 @@ class ProjectManager:
                     project.deps_installed = True
                     self.db.update_project(project)
                 
-                # Get start command
                 cmd = self.get_start_command(project, project_dir)
                 if not cmd:
                     return False, "Unsupported project type"
                 
-                # Prepare environment
                 env = os.environ.copy()
                 env['PORT'] = str(project.port or 8000)
                 if project.project_type == 'telegram':
-                    env.pop('BOT_TOKEN', None)  # Don't inherit bot token
+                    env.pop('BOT_TOKEN', None)
                 
-                # Start process
                 log_path = self.get_log_path(project_id)
                 log_dir = os.path.dirname(log_path)
                 os.makedirs(log_dir, exist_ok=True)
+                
+                # Clear old error log
+                project.error_log = ""
                 
                 with open(log_path, 'a') as log_file:
                     log_file.write(f"\n{'='*50}\n")
@@ -986,7 +983,7 @@ class ProjectManager:
                         cmd,
                         cwd=project_dir,
                         stdout=log_file,
-                        stderr=log_file,
+                        stderr=subprocess.STDOUT,
                         env=env,
                         preexec_fn=os.setsid if os.name != 'nt' else None
                     )
@@ -997,15 +994,12 @@ class ProjectManager:
                 project.status = ProjectStatus.RUNNING
                 project.last_started = datetime.now()
                 project.start_count += 1
-                project.error_log = ""
                 
-                # Calculate source hash if not set
                 if not project.source_hash:
                     project.source_hash = self.calculate_source_hash(project_dir)
                 
                 self.db.update_project(project)
                 
-                # Start monitoring
                 threading.Thread(
                     target=self.monitor_project,
                     args=(project_id,),
@@ -1016,7 +1010,10 @@ class ProjectManager:
                 
             except Exception as e:
                 self.logger.error(f"Start project error: {e}")
-                return False, f"Start error: {str(e)}"
+                error_msg = str(e)
+                project.error_log = error_msg
+                self.db.update_project(project)
+                return False, f"Start error: {error_msg}"
     
     def stop_project(self, project_id: int) -> Tuple[bool, str]:
         if project_id not in self.running_processes:
@@ -1026,7 +1023,6 @@ class ProjectManager:
             try:
                 process = self.running_processes[project_id]
                 
-                # Kill process group
                 if os.name != 'nt':
                     import signal
                     os.killpg(os.getpgid(process.pid), signal.SIGTERM)
@@ -1054,16 +1050,12 @@ class ProjectManager:
                 return False, f"Stop error: {str(e)}"
     
     def restart_project(self, project_id: int) -> Tuple[bool, str]:
-        # Stop first
         if project_id in self.running_processes:
             success, message = self.stop_project(project_id)
             if not success:
                 return False, f"Stop failed: {message}"
         
-        # Wait a moment
         time.sleep(1)
-        
-        # Start
         return self.start_project(project_id)
     
     def monitor_project(self, project_id: int):
@@ -1071,27 +1063,25 @@ class ProjectManager:
             try:
                 process = self.running_processes[project_id]
                 
-                # Check if process is still running
                 if process.poll() is not None:
-                    # Process exited
                     project = self.db.get_project(project_id)
                     if project:
                         project.status = ProjectStatus.ERROR if project.auto_restart else ProjectStatus.STOPPED
                         project.pid = None
                         
-                        # Read error log
                         log_path = self.get_log_path(project_id)
                         if os.path.exists(log_path):
                             with open(log_path, 'r') as f:
                                 content = f.read()
                                 if content:
-                                    project.error_log = content[-2000:]  # Last 2000 chars
+                                    project.error_log = content[-2000:]
+                                else:
+                                    project.error_log = "Process exited with no output"
                         
                         self.db.update_project(project)
                     
                     del self.running_processes[project_id]
                     
-                    # Auto-restart if enabled
                     if project and project.auto_restart:
                         project.restart_count += 1
                         project.last_restart = datetime.now()
@@ -1099,7 +1089,6 @@ class ProjectManager:
                         
                         self.logger.info(f"Auto-restarting project {project_id} (attempt {project.restart_count})")
                         
-                        # Wait and restart
                         time.sleep(5)
                         success, message = self.start_project(project_id)
                         if success:
@@ -1109,7 +1098,6 @@ class ProjectManager:
                     
                     break
                 
-                # Update resource usage
                 try:
                     p = psutil.Process(process.pid)
                     cpu = p.cpu_percent(interval=0.5)
@@ -1132,40 +1120,32 @@ class ProjectManager:
     def deploy_project_from_zip(self, user_id: int, file_path: str, project_name: str, 
                                is_free_trial: bool = False) -> Tuple[bool, str, Optional[int]]:
         try:
-            # Validate ZIP
             if not zipfile.is_zipfile(file_path):
                 return False, "Invalid ZIP file", None
             
-            # Create project directory
             user_path = self.get_user_path(user_id)
             project_path = os.path.join(user_path, project_name)
             
             if os.path.exists(project_path):
                 return False, "Project already exists", None
             
-            # Extract ZIP
             os.makedirs(project_path, exist_ok=True)
             with zipfile.ZipFile(file_path, 'r') as zip_ref:
                 zip_ref.extractall(project_path)
             
-            # Find main file
             main_file = self.find_main_file(project_path)
             if not main_file:
                 shutil.rmtree(project_path, ignore_errors=True)
                 return False, "No main file found", None
             
-            # Detect framework
             framework, project_type = self.detect_framework(project_path, main_file)
             
-            # Find available port for web apps
             port = None
             if framework.lower() in ['fastapi', 'flask', 'django', 'node.js', 'express']:
                 port = self.find_available_port()
             
-            # Calculate source hash
             source_hash = self.calculate_source_hash(project_path)
             
-            # Create project in database
             project = Project(
                 id=0,
                 user_id=user_id,
@@ -1187,12 +1167,10 @@ class ProjectManager:
             
             project_id = self.db.create_project(project)
             
-            # Install dependencies
             success, message = self.install_dependencies(project_path, framework)
             if success:
                 project.deps_installed = True
             
-            # Start project
             project.status = ProjectStatus.RUNNING
             self.db.update_project(project)
             
@@ -1212,20 +1190,16 @@ class ProjectManager:
         if not project:
             return False, "Project not found"
         
-        # Stop if running
         if project_id in self.running_processes:
             self.stop_project(project_id)
         
-        # Delete files
         project_path = self.get_project_path(project.user_id, project.name)
         shutil.rmtree(project_path, ignore_errors=True)
         
-        # Delete logs
         log_path = self.get_log_path(project_id)
         if os.path.exists(log_path):
             os.remove(log_path)
         
-        # Delete from database
         self.db.delete_project(project_id)
         
         return True, "Project deleted"
@@ -1235,7 +1209,6 @@ def setup_logging():
     logger = logging.getLogger("HostingBot")
     logger.setLevel(logging.INFO)
     
-    # Console handler
     console = logging.StreamHandler()
     console.setFormatter(logging.Formatter(
         '%(asctime)s | %(levelname)s | %(message)s',
@@ -1243,7 +1216,6 @@ def setup_logging():
     ))
     logger.addHandler(console)
     
-    # File handler
     file_handler = logging.FileHandler(os.path.join(LOG_DIR, "hosting_bot.log"))
     file_handler.setFormatter(logging.Formatter(
         '%(asctime)s | %(levelname)s | %(funcName)s:%(lineno)d | %(message)s'
@@ -1345,7 +1317,7 @@ def increment_version(version: str, increment_type: str = 'patch') -> str:
         return f"{int(major) + 1}.0.0"
     elif increment_type == 'minor':
         return f"{major}.{int(minor) + 1}.0"
-    else:  # patch
+    else:
         return f"{major}.{minor}.{int(patch) + 1}"
 
 # ===== DASHBOARD FUNCTIONS =====
@@ -1404,7 +1376,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or ""
     
-    # Register user
     user = db.get_user(user_id)
     if not user:
         user = db.create_user(user_id, username)
@@ -1412,7 +1383,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user.username = username
         db.update_user(user)
     
-    # Check if user is banned
     if user.is_banned:
         await update.message.reply_text(
             "🚫 <b>You have been banned from using this bot</b>\n\n"
@@ -1455,7 +1425,6 @@ Welcome {get_user_display(update.effective_user)}! 👋
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show the main dashboard"""
     user_id = update.effective_user.id
     
     user = db.get_user(user_id)
@@ -1491,7 +1460,6 @@ Select an option below:
     await update.message.reply_text(dashboard_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 async def host_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Host a new bot"""
     user_id = update.effective_user.id
     
     user = db.get_user(user_id)
@@ -1531,7 +1499,6 @@ async def host_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def mybots_command(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
-    """List user's projects"""
     user_id = update.effective_user.id
     
     user = db.get_user(user_id)
@@ -1549,7 +1516,6 @@ async def mybots_command(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
         )
         return
     
-    # Pagination
     per_page = 5
     total_pages = max(1, (len(projects) + per_page - 1) // per_page)
     page = max(1, min(page, total_pages))
@@ -1557,7 +1523,6 @@ async def mybots_command(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
     end_idx = min(start_idx + per_page, len(projects))
     page_projects = projects[start_idx:end_idx]
     
-    # Count running projects
     running = sum(1 for p in projects if p.status == ProjectStatus.RUNNING)
     
     text = f"""
@@ -1581,7 +1546,6 @@ async def mybots_command(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
   📊 CPU: {project.cpu_usage:.1f}% | RAM: {project.memory_usage:.1f}MB
 """
     
-    # Create keyboard for projects
     keyboard = []
     for project in page_projects:
         keyboard.append([
@@ -1591,7 +1555,6 @@ async def mybots_command(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
             )
         ])
     
-    # Add pagination
     nav_buttons = []
     if page > 1:
         nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"mybots_{page-1}"))
@@ -1609,7 +1572,6 @@ async def mybots_command(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
 async def save_source_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Save project source code"""
     user_id = update.effective_user.id
     
     user = db.get_user(user_id)
@@ -1639,7 +1601,6 @@ async def save_source_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 async def update_source_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Update project source code"""
     user_id = update.effective_user.id
     
     user = db.get_user(user_id)
@@ -1670,26 +1631,22 @@ async def update_source_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show system status"""
     user_id = update.effective_user.id
     
     if not is_admin(user_id):
         await update.message.reply_text("❌ Admin only command.")
         return
     
-    # System stats
     cpu = psutil.cpu_percent(interval=1)
     memory = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
     
-    # Database stats
     projects = db.get_all_projects()
     running = sum(1 for p in projects if p.status == ProjectStatus.RUNNING)
     users = []
     with db.get_connection() as conn:
         users = conn.execute("SELECT COUNT(*) as count FROM users").fetchone()['count']
     
-    # Count source updates
     with db.get_connection() as conn:
         updates = conn.execute("SELECT COUNT(*) as count FROM source_updates").fetchone()['count']
     
@@ -1717,7 +1674,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """View system logs"""
     user_id = update.effective_user.id
     
     if not is_admin(user_id):
@@ -1741,7 +1697,6 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== ADMIN COMMANDS =====
 async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin panel"""
     user_id = update.effective_user.id
     
     if not is_admin(user_id):
@@ -1764,7 +1719,6 @@ async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
-    """Manage users"""
     user_id = update.effective_user.id
     
     if not is_admin(user_id):
@@ -1809,7 +1763,6 @@ async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     keyboard = []
     
-    # Add user actions
     for user_row in page_users:
         keyboard.append([
             InlineKeyboardButton(
@@ -1818,7 +1771,6 @@ async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         ])
     
-    # Pagination
     nav_buttons = []
     if page > 1:
         nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"admin_users_{page-1}"))
@@ -1836,7 +1788,6 @@ async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_user_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
-    """Show user detail and management options"""
     user_id = update.effective_user.id
     
     if not is_admin(user_id):
@@ -1866,7 +1817,6 @@ async def admin_user_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     
     keyboard = []
     
-    # Action buttons
     if user.is_banned:
         keyboard.append([InlineKeyboardButton("🔓 Unban User", callback_data=f"admin_unban_{user.user_id}")])
     else:
@@ -1886,7 +1836,6 @@ async def admin_user_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_backups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin view source backups"""
     user_id = update.effective_user.id
     
     if not is_admin(user_id):
@@ -1923,15 +1872,12 @@ async def admin_backups_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ===== FILE HANDLER =====
 async def file_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle ZIP file upload for hosting or update"""
     user_id = update.effective_user.id
     
-    # Check if user is updating a project
     if user_id in update_states and update_states[user_id].get("state") == "awaiting_update":
         await handle_update_upload(update, context)
         return
     
-    # Check if user is expecting to upload
     if user_id not in user_states or user_states[user_id].get("state") != "awaiting_zip":
         await update.message.reply_text("❌ Use /host first to deploy a bot.")
         return
@@ -1950,13 +1896,11 @@ async def file_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     
-    # Get user
     user = db.get_user(user_id)
     if not user or user.is_banned:
         await update.message.reply_text("❌ You are not authorized to host bots.")
         return
     
-    # Check limit
     if not can_host(user_id):
         await update.message.reply_text(
             "❌ You have reached your project limit.\n"
@@ -1964,7 +1908,6 @@ async def file_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     
-    # Download file
     processing_msg = await update.message.reply_text("📥 <b>Processing your bot...</b>", parse_mode=ParseMode.HTML)
     
     try:
@@ -1972,27 +1915,22 @@ async def file_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         temp_path = os.path.join(TEMP_DIR, f"{user_id}_{document.file_name}")
         await file.download_to_drive(temp_path)
         
-        # Generate project name
         project_name = re.sub(r'[^a-zA-Z0-9_-]', '', document.file_name.replace('.zip', ''))
         if not project_name:
             project_name = f"bot_{user_id}_{int(time.time())}"
         
-        # Deploy
         success, message, project_id = project_manager.deploy_project_from_zip(
             user_id, temp_path, project_name, is_free_trial=False
         )
         
-        # Cleanup temp file
         if os.path.exists(temp_path):
             os.remove(temp_path)
         
-        # Update user total projects
         if success:
             projects = db.get_user_projects(user_id)
             user.total_projects = len(projects)
             db.update_user(user)
         
-        # Cleanup state
         if user_id in user_states:
             del user_states[user_id]
         
@@ -2004,7 +1942,7 @@ async def file_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"📋 <b>Framework:</b> {project.framework}\n"
                 f"📄 <b>Main File:</b> {project.main_file}\n"
                 f"📌 <b>Version:</b> {project.version}\n"
-                f"🔒 <b>Source Hash:</b> {project.source_hash[:8]}...\n\n"
+                f"🔒 <b>Source Hash:</b> {project.source_hash[:8] if project.source_hash else 'N/A'}...\n\n"
                 f"Use /mybots to manage your projects.",
                 parse_mode=ParseMode.HTML
             )
@@ -2019,7 +1957,6 @@ async def file_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await processing_msg.edit_text(f"❌ <b>Error</b>\n\n{str(e)}", parse_mode=ParseMode.HTML)
 
 async def handle_update_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle ZIP upload for updating a project"""
     user_id = update.effective_user.id
     
     if user_id not in update_states:
@@ -2046,22 +1983,17 @@ async def handle_update_upload(update: Update, context: ContextTypes.DEFAULT_TYP
     processing_msg = await update.message.reply_text("🔄 <b>Updating bot source...</b>", parse_mode=ParseMode.HTML)
     
     try:
-        # Download file
         file = await context.bot.get_file(document.file_id)
         temp_path = os.path.join(TEMP_DIR, f"update_{user_id}_{document.file_name}")
         await file.download_to_drive(temp_path)
         
-        # Get version
         version = update_states[user_id].get("version", "1.0.0")
         
-        # Update project
         success, message = project_manager.update_project_source(project_id, temp_path, version)
         
-        # Cleanup temp file
         if os.path.exists(temp_path):
             os.remove(temp_path)
         
-        # Cleanup state
         if user_id in update_states:
             del update_states[user_id]
         
@@ -2073,7 +2005,7 @@ async def handle_update_upload(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"📌 <b>New Version:</b> {project.version}\n"
                 f"📋 <b>Framework:</b> {project.framework}\n"
                 f"📄 <b>Main File:</b> {project.main_file}\n"
-                f"🔒 <b>Source Hash:</b> {project.source_hash[:8]}...\n\n"
+                f"🔒 <b>Source Hash:</b> {project.source_hash[:8] if project.source_hash else 'N/A'}...\n\n"
                 f"{message}",
                 parse_mode=ParseMode.HTML
             )
@@ -2089,7 +2021,6 @@ async def handle_update_upload(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ===== CALLBACK HANDLER =====
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all callbacks"""
     query = update.callback_query
     await query.answer()
     
@@ -2107,7 +2038,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Project not found.")
             return
         
-        # Check ownership or admin
         if project.user_id != user_id and not is_admin(user_id):
             await query.edit_message_text("❌ You don't own this project.")
             return
@@ -2156,43 +2086,65 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log_path = project_manager.get_log_path(project_id)
             if os.path.exists(log_path):
                 with open(log_path, 'r') as f:
-                    log_content = f.read()[-3000:]  # Last 3000 chars
-                await query.edit_message_text(
-                    f"📋 <b>Logs for {project.name}</b>\n\n<pre>{log_content}</pre>",
-                    parse_mode=ParseMode.HTML
-                )
+                    log_content = f.read()
+                    if log_content:
+                        display_log = log_content[-3000:]
+                        await query.edit_message_text(
+                            f"📋 <b>Logs for {project.name}</b>\n\n<pre>{html.escape(display_log)}</pre>",
+                            parse_mode=ParseMode.HTML
+                        )
+                    else:
+                        await query.edit_message_text("📋 Log file is empty.")
             else:
                 await query.edit_message_text("📋 No logs available.")
         
         elif action == "save_source":
-            # Save project source
-            success, backup_path = project_manager.backup_project_source(project)
-            if success:
-                # Send the ZIP file
-                with open(backup_path, 'rb') as f:
+            # Show processing message
+            await query.edit_message_text(
+                f"📦 <b>Creating backup of {project.name}...</b>",
+                parse_mode=ParseMode.HTML
+            )
+            
+            success, message, backup_path = project_manager.backup_project_source(project)
+            if success and backup_path and os.path.exists(backup_path):
+                try:
+                    # Send the ZIP file
+                    with open(backup_path, 'rb') as f:
+                        await context.bot.send_document(
+                            chat_id=user_id,
+                            document=f,
+                            filename=f"{project.name}_v{project.version}_{datetime.now().strftime('%Y%m%d')}.zip",
+                            caption=f"📦 <b>Source Code Backup</b>\n\n"
+                                   f"📦 Project: <code>{project.name}</code>\n"
+                                   f"📌 Version: v{project.version}\n"
+                                   f"💾 Size: {os.path.getsize(backup_path) / 1024:.1f} KB\n"
+                                   f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                                   f"✅ Source saved successfully!",
+                            parse_mode=ParseMode.HTML
+                        )
+                        
+                        await query.edit_message_text(
+                            f"✅ <b>Source saved successfully!</b>\n\n"
+                            f"📦 Project: {project.name}\n"
+                            f"📌 Version: v{project.version}\n"
+                            f"💾 Size: {os.path.getsize(backup_path) / 1024:.1f} KB\n\n"
+                            f"📄 Check your chat for the downloaded file.",
+                            parse_mode=ParseMode.HTML
+                        )
+                except Exception as e:
+                    logger.error(f"Error sending backup file: {e}")
                     await query.edit_message_text(
-                        f"✅ <b>Source saved!</b>\n\n"
-                        f"📦 Project: {project.name}\n"
-                        f"📌 Version: {project.version}\n"
-                        f"💾 Size: {os.path.getsize(backup_path) / 1024:.1f}KB\n\n"
-                        f"Sending the source file...",
+                        f"❌ <b>Failed to send backup file</b>\n\nError: {str(e)}",
                         parse_mode=ParseMode.HTML
-                    )
-                    await context.bot.send_document(
-                        chat_id=user_id,
-                        document=f,
-                        filename=f"{project.name}_v{project.version}.zip",
-                        caption=f"📦 Source code for {project.name} (v{project.version})"
                     )
             else:
                 await query.edit_message_text(
-                    f"❌ <b>Save Failed</b>\n\n{backup_path}",
+                    f"❌ <b>Save Failed</b>\n\n{message}",
                     parse_mode=ParseMode.HTML
                 )
             return
         
         elif action == "update_source":
-            # Set state for update
             update_states[user_id] = {
                 "state": "awaiting_update",
                 "project_id": project_id,
@@ -2227,26 +2179,47 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ You don't own this project.")
             return
         
-        success, backup_path = project_manager.backup_project_source(project)
-        if success:
-            with open(backup_path, 'rb') as f:
+        # Show processing message
+        await query.edit_message_text(
+            f"📦 <b>Creating backup of {project.name}...</b>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        success, message, backup_path = project_manager.backup_project_source(project)
+        if success and backup_path and os.path.exists(backup_path):
+            try:
+                # Send the ZIP file
+                with open(backup_path, 'rb') as f:
+                    await context.bot.send_document(
+                        chat_id=user_id,
+                        document=f,
+                        filename=f"{project.name}_v{project.version}_{datetime.now().strftime('%Y%m%d')}.zip",
+                        caption=f"📦 <b>Source Code Backup</b>\n\n"
+                               f"📦 Project: <code>{project.name}</code>\n"
+                               f"📌 Version: v{project.version}\n"
+                               f"💾 Size: {os.path.getsize(backup_path) / 1024:.1f} KB\n"
+                               f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                               f"✅ Source saved successfully!",
+                        parse_mode=ParseMode.HTML
+                    )
+                    
+                    await query.edit_message_text(
+                        f"✅ <b>Source saved successfully!</b>\n\n"
+                        f"📦 Project: {project.name}\n"
+                        f"📌 Version: v{project.version}\n"
+                        f"💾 Size: {os.path.getsize(backup_path) / 1024:.1f} KB\n\n"
+                        f"📄 Check your chat for the downloaded file.",
+                        parse_mode=ParseMode.HTML
+                    )
+            except Exception as e:
+                logger.error(f"Error sending backup file: {e}")
                 await query.edit_message_text(
-                    f"✅ <b>Source saved!</b>\n\n"
-                    f"📦 Project: {project.name}\n"
-                    f"📌 Version: {project.version}\n"
-                    f"💾 Size: {os.path.getsize(backup_path) / 1024:.1f}KB\n\n"
-                    f"Sending the source file...",
+                    f"❌ <b>Failed to send backup file</b>\n\nError: {str(e)}",
                     parse_mode=ParseMode.HTML
-                )
-                await context.bot.send_document(
-                    chat_id=user_id,
-                    document=f,
-                    filename=f"{project.name}_v{project.version}.zip",
-                    caption=f"📦 Source code for {project.name} (v{project.version})"
                 )
         else:
             await query.edit_message_text(
-                f"❌ <b>Save Failed</b>\n\n{backup_path}",
+                f"❌ <b>Save Failed</b>\n\n{message}",
                 parse_mode=ParseMode.HTML
             )
         return
@@ -2415,7 +2388,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if action == "refresh":
             await query.edit_message_text("🔄 <b>Refreshing System...</b>", parse_mode=ParseMode.HTML)
-            # Clear running processes
             for pid in list(project_manager.running_processes.keys()):
                 project_manager.stop_project(pid)
             await query.edit_message_text("✅ <b>System Refreshed</b>", parse_mode=ParseMode.HTML)
@@ -2432,11 +2404,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         return
     
-    # ===== DEFAULT =====
     await query.edit_message_text("❌ Unknown action.")
 
 async def show_project_details(update: Update, context: ContextTypes.DEFAULT_TYPE, project_id: int):
-    """Show detailed project information"""
     project = db.get_project(project_id)
     if not project:
         await update.callback_query.edit_message_text("❌ Project not found.")
@@ -2473,13 +2443,15 @@ async def show_project_details(update: Update, context: ContextTypes.DEFAULT_TYP
 • Auto-Restart: {'✅' if project.auto_restart else '❌'}
 • Dependencies: {'✅' if project.deps_installed else '❌'}
 • Free Trial: {'✅' if project.is_free_trial else '❌'}
+
+<b>📋 Error Log:</b>
+{html.escape(project.error_log[:500]) if project.error_log else 'No errors logged'}
 """
     
     keyboard = create_project_keyboard(project_id, project.status == ProjectStatus.RUNNING)
     await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 async def admin_all_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin view all projects"""
     user_id = update.effective_user.id
     
     if not is_admin(user_id):
@@ -2500,7 +2472,10 @@ async def admin_all_projects(update: Update, context: ContextTypes.DEFAULT_TYPE)
         status = get_status_emoji(project.status)
         text += f"{status} <b>{project.name}</b> (v{project.version})\n"
         text += f"  👤 {username} | {project.framework}\n"
-        text += f"  💻 CPU: {project.cpu_usage:.1f}% | RAM: {project.memory_usage:.1f}MB\n\n"
+        text += f"  💻 CPU: {project.cpu_usage:.1f}% | RAM: {project.memory_usage:.1f}MB\n"
+        if project.error_log:
+            text += f"  ⚠️ Error: {html.escape(project.error_log[:100])}...\n"
+        text += "\n"
     
     if len(projects) > 20:
         text += f"\n... and {len(projects) - 20} more projects"
@@ -2509,7 +2484,6 @@ async def admin_all_projects(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.callback_query.edit_message_text(text[:4096], parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_user_projects(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
-    """Admin view user's projects"""
     user_id = update.effective_user.id
     
     if not is_admin(user_id):
@@ -2528,18 +2502,19 @@ async def admin_user_projects(update: Update, context: ContextTypes.DEFAULT_TYPE
     for project in projects:
         status = get_status_emoji(project.status)
         text += f"{status} <b>{project.name}</b> (v{project.version}) | {project.framework}\n"
-        text += f"  Status: {project.status.value.title()} | CPU: {project.cpu_usage:.1f}%\n\n"
+        text += f"  Status: {project.status.value.title()} | CPU: {project.cpu_usage:.1f}%\n"
+        if project.error_log:
+            text += f"  ⚠️ Error: {html.escape(project.error_log[:100])}...\n"
+        text += "\n"
     
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data=f"admin_user_{target_user_id}")]]
     await update.callback_query.edit_message_text(text[:4096], parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ===== MESSAGE HANDLER =====
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages"""
     user_id = update.effective_user.id
     text = update.message.text
     
-    # Check for broadcast mode
     if user_id in broadcast_states and broadcast_states[user_id].get("state") == "awaiting_broadcast":
         if text == "/cancel":
             del broadcast_states[user_id]
@@ -2549,7 +2524,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await broadcast_send(update, context, text)
         return
     
-    # Handle button commands
     if text == "📦 My Projects":
         await mybots_command(update, context)
     elif text == "🚀 Deploy Bot":
@@ -2578,7 +2552,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE, message: str):
-    """Send broadcast message to all users"""
     user_id = update.effective_user.id
     
     if not is_admin(user_id):
@@ -2611,9 +2584,7 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
         parse_mode=ParseMode.HTML
     )
 
-# ===== MEDIA BROADCAST =====
 async def media_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle media for broadcast"""
     user_id = update.effective_user.id
     
     if user_id not in broadcast_states or broadcast_states[user_id].get("state") != "awaiting_broadcast":
@@ -2668,7 +2639,6 @@ async def media_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_
 
 # ===== ERROR HANDLER =====
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")
     try:
         if update and update.effective_message:
@@ -2681,7 +2651,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== CANCEL COMMAND =====
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel current operation"""
     user_id = update.effective_user.id
     
     if user_id in user_states:
@@ -2697,7 +2666,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== MAIN =====
 def main():
-    """Main entry point"""
     print(f"""
 ╔═══════════════════════════════════════╗
 ║   🚀 ADVANCED BOT HOSTING PLATFORM    ║
@@ -2705,6 +2673,7 @@ def main():
 ║   Creator: @abbsydurov                ║
 ║   Channel: https://t.me/DEviNePORTaL  ║
 ║   Features: Save & Update Source      ║
+║   Fixed: Error Logs & Save Source     ║
 ╚═══════════════════════════════════════╝
     """)
     
@@ -2712,10 +2681,8 @@ def main():
     logger.info(f"Owner: {OWNER_ID}")
     logger.info(f"Channel: {CHANNEL_ID}")
     
-    # Create application
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("dashboard", dashboard_command))
     app.add_handler(CommandHandler("host", host_command))
@@ -2735,7 +2702,6 @@ def main():
     
     app.add_error_handler(error_handler)
     
-    # Start auto-restart for projects
     def auto_restart_loop():
         while True:
             try:
@@ -2751,7 +2717,6 @@ def main():
     
     threading.Thread(target=auto_restart_loop, daemon=True).start()
     
-    # Start bot
     logger.info("Starting bot...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
