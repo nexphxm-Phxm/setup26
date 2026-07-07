@@ -1,4 +1,12 @@
 {
-  "python": "3.11.8",
-  "requirements": "requirements.txt"
+  "system_packages": [
+    "python3.11",
+    "python3-pip",
+    "python3.11-dev"
+  ],
+  "python": {
+    "installer": "system"
+  },
+  "requirements": "requirements.txt",
+  "entrypoint": "python3.11 host.py"
 }
