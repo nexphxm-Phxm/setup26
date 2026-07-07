@@ -3,7 +3,7 @@
 Modern Dashboard | Enhanced Security | Advanced Admin Controls
 Creator: @abbsydurov
 Channel: https://t.me/DEviNePORTaL
-Features: Save & Update Bot Source Files | Fixed Error Logs & Save Source
+Features: Save & Update Bot Source Files | Fixed Error Logs & Save Source & View Logs
 """
 
 import os
@@ -2084,19 +2084,53 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         elif action == "logs":
             log_path = project_manager.get_log_path(project_id)
+            
+            # Check if log file exists
             if os.path.exists(log_path):
-                with open(log_path, 'r') as f:
-                    log_content = f.read()
-                    if log_content:
+                try:
+                    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        log_content = f.read()
+                        
+                    if log_content and log_content.strip():
+                        # Get last 3000 characters for display
                         display_log = log_content[-3000:]
+                        if len(log_content) > 3000:
+                            display_log = "... (truncated) \n" + display_log
+                        
+                        # Format the log message
+                        log_message = f"📋 <b>Logs for {project.name}</b>\n\n<pre>{html.escape(display_log)}</pre>"
+                        
+                        # Check if message is too long
+                        if len(log_message) > 4096:
+                            # Split into multiple messages
+                            parts = [log_message[i:i+4000] for i in range(0, len(log_message), 4000)]
+                            for i, part in enumerate(parts):
+                                if i == 0:
+                                    await query.edit_message_text(part, parse_mode=ParseMode.HTML)
+                                else:
+                                    await context.bot.send_message(
+                                        chat_id=user_id,
+                                        text=part,
+                                        parse_mode=ParseMode.HTML
+                                    )
+                        else:
+                            await query.edit_message_text(log_message, parse_mode=ParseMode.HTML)
+                    else:
                         await query.edit_message_text(
-                            f"📋 <b>Logs for {project.name}</b>\n\n<pre>{html.escape(display_log)}</pre>",
+                            f"📋 <b>Logs for {project.name}</b>\n\nLog file is empty.",
                             parse_mode=ParseMode.HTML
                         )
-                    else:
-                        await query.edit_message_text("📋 Log file is empty.")
+                except Exception as e:
+                    logger.error(f"Error reading log file: {e}")
+                    await query.edit_message_text(
+                        f"❌ <b>Error reading logs</b>\n\n{str(e)}",
+                        parse_mode=ParseMode.HTML
+                    )
             else:
-                await query.edit_message_text("📋 No logs available.")
+                await query.edit_message_text(
+                    f"📋 <b>Logs for {project.name}</b>\n\nNo logs available. The project may not have been started yet.",
+                    parse_mode=ParseMode.HTML
+                )
         
         elif action == "save_source":
             # Show processing message
@@ -2674,6 +2708,7 @@ def main():
 ║   Channel: https://t.me/DEviNePORTaL  ║
 ║   Features: Save & Update Source      ║
 ║   Fixed: Error Logs & Save Source     ║
+║   Fixed: View Logs Error              ║
 ╚═══════════════════════════════════════╝
     """)
     
