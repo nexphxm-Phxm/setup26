@@ -36,7 +36,7 @@ from enum import Enum
 from urllib.parse import urlparse
 
 # ===== ENVIRONMENT CONFIGURATION =====
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8585334842:AAHqGfyEIlMndh8qP3lfc4JKRYgcr8rNGPM bot token")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8585334842:AAHqGfyEIlMndh8qP3lfc4JKRYgcr8rNGPM")
 OWNER_ID = int(os.environ.get("OWNER_ID", "5157557268"))
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1004414969225"))
 OWNER_USERNAME = "@abbsydurov"
