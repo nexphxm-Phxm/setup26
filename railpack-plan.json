@@ -1,0 +1,5 @@
+{
+  "python": "3.11.8",
+  "requirements": "requirements.txt",
+  "entrypoint": "python main.py"  // or your actual entrypoint
+}
