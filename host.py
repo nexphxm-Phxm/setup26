@@ -2707,8 +2707,7 @@ def main():
 ║   Creator: @abbsydurov                ║
 ║   Channel: https://t.me/DEviNePORTaL  ║
 ║   Features: Save & Update Source      ║
-║   Fixed: Error Logs & Save Source     ║
-║   Fixed: View Logs Error              ║
+║   Fixed: All Features Working         ║
 ╚═══════════════════════════════════════╝
     """)
     
